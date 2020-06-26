@@ -1,0 +1,353 @@
+---
+title: "Examining NOM-INS construction in Russian"
+output:
+  pdf_document: default
+---
+
+```{r}
+library(randomForest)
+require(caTools)
+library(knitr)
+library(factoextra)
+library(ca)
+library(caret)
+library(ROCR)
+```
+
+## 1. Data description
+
+Current project is based on the pre-collected [dataset](https://dataverse.no/dataset.xhtml?persistentId=doi:10.18710/ZAM96S&version=1.0) from Russian National Corpus. The authors of the dataset are Tore Nesset, Laura A. Janda and Mihail Kopotev. The objective of the dataset and my project is to examine NOM-INS construction in Russian like *“дурак дураком”* and *“вода водой”*. 
+
+This dataset consists of two parts: the first one examines **plural forms** of such constructions and the second one – **singular forms**. Both parts have the same set of features: 
+
+* semantics of the construction (*abundance, extreme, instrument, paragon, and topic change*)
+* syntactic role of the noun (*Ins verb-governed, Nom verb-governed, Nom/Ins verb governed and Ungoverned*)
+* semantic classes of nouns (*abstract, concrete, human + animal, substances*)
+* pejorative (*as involving or not involving a pejorative nuance*)
+* chained (*marks cases with 2+ occurrences of constructions*)
+* associated verb
+* left and right contexts
+* construction itself
+* punctuation marks immediately following the construction
+* metadata (*title of the work, name and birthday of the author, header, year of creation, “sphere” and “type” of the text, topic, publication name and year*)
+* full context
+
+This list of features will be expanded. Primarily, the morphological parameters of the associated verb are going to be added. Also, using context and morphology, I am going to create morphological patterns of the construction’s usage.
+
+My goal is to examine what features have the best correlation to the semantics of the construction. I will use decision trees and linear regression models to achieve this. The hypothesis is that syntactic role and semantic class of nouns will be most relevant features for the construction classification.
+
+Let's formulate the hypotheses more formally.
+
+H_0: `Semantics` feature is independent and do not correlate with other features.
+H_1: `Semantics` feature is not independent and correlates with some other features.
+H_2: `Syntax` and `Semantic_Classes_Of_Nouns`are the best predictors for the `Semantics` feature.
+
+## 2. Data prepricessing
+
+### 2.1. Python 
+
+The datasets are preprocessed via python, full notebook with the code can be found [here](https://github.com/mkilina/ling_data_project/blob/master/data_preprocessing.ipynb). 
+
+What was added:
+
+* columns `Left_context_tags` and `Right_context_tags` with Opencorpora POS tags of every word in left and right contexts (taken from columns `Left_context` and `Right_context` respectively)
+* column `Verb_tags` which contains Opencorpora POS tags of associated verbs in normal form (taken from `Associated_verbs` column)
+* columns `Left_context_tags_norm` and `Right_context_tags_norm` with Opencorpora POS tags of normalized words from left and right contexts
+* assessment of `Pejorative` columns in both singular and plural variants of dataset (in those rows where it wasn't assessed)
+* deletion of non-informative columns such as metadata, punctuation, etc.
+
+### 2.2. R
+
+Now let's look closely at the data.
+```{r}
+dataSG <- read.csv2('https://raw.githubusercontent.com/mkilina/ling_data_project/master/dataSG.csv', sep=',', encoding="UTF-8", stringsAsFactors = FALSE)
+dataPL <- read.csv2('https://raw.githubusercontent.com/mkilina/ling_data_project/master/dataPL.csv', sep=',', encoding="UTF-8", stringsAsFactors = FALSE)
+dataSG
+```
+
+```{r}
+table(dataSG$Semantic_classes_of_noun)
+table(dataPL$Semantic_classes_of_nouns)
+```
+Here in `dataSG$Semantic_classes_of_nouns` we can see that "abstract" and "Abstract" are treated as 2 different values, whilst it should be one value. Let's rename "abstract". We also see 2 missed values of this feature. Let's look closely to understand if we can fill the gaps.
+
+In addiction, there are also misspellings in `dataSG$Syntax` ("ungoverned" and "Ungoverned"). Let's fix this values in the same way.
+```{r}
+dataSG[dataSG$Semantic_classes_of_nouns == "abstract",]$Semantic_classes_of_nouns <- "Abstract"
+dataSG[dataSG$Syntax == "ungoverned",]$Syntax <- "Ungoverned"
+table(dataSG$Semantic_classes_of_nouns)
+dataSG[dataSG$Semantic_classes_of_nouns == "",]
+```
+Now all the "abstract" values became "Abstract". As for the missed values, we can add "Concrete" value to the example *"город городом"*. But *"бедняк бедой"* is better to be deleted due to the fact that *"бедняк"* is a concrete noun, whilst *"беда"* is an abstract one.
+```{r}
+dataSG[dataSG$Semantic_classes_of_nouns == "" & dataSG$Semantics == "Paragon",]$Semantic_classes_of_nouns <- "Concrete"
+dataSG <- dataSG[!dataSG$Semantic_classes_of_nouns == "",]
+table(dataSG$Semantic_classes_of_nouns)
+```
+Now we can see that is dataSG the amount of Abstract and Concrete nouns is almost the same. There are a bit less Human+animals and way less Substances. In dataPL there are a lot of Concrete nouns and much less other types of nouns.
+```{r}
+table(dataSG$Pejorative)
+```
+Here we can see that there are misakes in spelling some answers in `dataSG$Pejorative` and also 13 empty values. Let's fix mistakes and delete empty values.
+```{r}
+dataSG[dataSG$Pejorative == "on",]$Pejorative <- "no"
+dataSG[dataSG$Pejorative == "тщ",]$Pejorative <- "no"
+dataPL[dataPL$Pejorative == "тщ",]$Pejorative <- "no"
+dataSG[dataSG$Pejorative == "ye",]$Pejorative <- "yes"
+dataSG <- dataSG[!dataSG$Pejorative == "",]
+table(dataSG$Pejorative)
+```
+Our objective now is to merge these two tables and add a column `Grammatical_number` with "sing" and "plur" options.
+```{r} 
+dataSG['Grammatical_number'] <- "sing"
+dataPL['Grammatical_number'] <- "plur"
+data <- rbind(dataSG, dataPL)
+data
+```
+
+## 3. Data visualisation
+
+After we prepared our data, let's search for some consistent patterns. We will check the interdependencies between `Semantics` and other classes.
+```{r}
+t1 = table(data$Semantics, data$Semantic_classes_of_nouns)
+t1
+```
+
+```{r}
+chisq.test(data$Semantics, data$Semantic_classes_of_nouns)
+```
+There is a dependency between `Semantics` and `Semantic_classes_of_nouns` (p-value is less then 0.05). Let's cunduct a correspondence analysis and visualyse it. 
+```{r}
+tt = as.data.frame.matrix(t1)
+tt_ca = ca(tt)
+fviz_ca_biplot(tt_ca, repel = TRUE)
+```
+Topic_change, Instrument and Abudance meanings tend to relate to the concrete nouns. Extreme meaning may relate to Abstract nouns, Substances and Human+Animals. Paragon meanins relate both to Substances and Human+Animals.
+
+Now let's look if there is a dependency between `Semantics` and `Grammatical_number`.
+```{r}
+table(data$Semantics, data$Grammatical_number)
+```
+
+```{r}
+chisq.test(data$Semantics, data$Grammatical_number)
+```
+Yes, `Grammatical_number` is an important feature to predict `Semantics` (p-value is less then 0.05).
+
+Now let's find out if `Syntax` is important for the prediction of `Semantics`.
+```{r}
+t2 = table(data$Semantics, data$Syntax)
+t2
+```
+
+```{r}
+chisq.test(data$Semantics, data$Syntax)
+```
+We can see that p-value is also less then 0.05, so we can conclude that `Syntax` also is an important feature. Let's visualyze the correspondence analysis.
+```{r}
+tt = as.data.frame.matrix(t2)
+tt_ca = ca(tt)
+fviz_ca_biplot(tt_ca, repel = TRUE)
+```
+Topic_change tend to be Ungoverned, Paragon meanings are more likely to be governed by Accusative verbs. The rest of the meanings are located closely to Nominative and Instrumental verbs and can be governed by all of them.
+
+Let's conduct the rest of the Pearson's Chi-squared tests (for all the features that weren't mentioned earlier).
+```{r}
+chisq.test(data$Semantics, data$Pejorative)
+```
+
+```{r}
+chisq.test(data$Semantics, data$Chained)
+```
+
+```{r}
+chisq.test(data$Semantics, data$Author)
+```
+
+```{r}
+chisq.test(data$Semantics, data$Created)
+```
+
+```{r}
+chisq.test(data$Semantics, data$Publ_year)
+```
+
+```{r}
+chisq.test(data$Semantics, data$Verb_tags)
+```
+
+```{r}
+chisq.test(data$Semantics, data$Left_context_tags)
+```
+
+```{r}
+chisq.test(data$Semantics, data$Right_context_tags)
+```
+All the features are important due to the Pearson's Chi-squared test. Though, we can finally reject our H_0 and accept H_1.
+
+## 4. Searching for the most important variables
+
+#### 4.1 Random Forest
+
+First, let's prepare the data.
+```{r}
+data <- transform(
+  data,
+  Semantics=as.factor(Semantics),
+  Syntax=as.factor(Syntax),
+  Semantic_classes_of_nouns=as.factor(Semantic_classes_of_nouns),
+  Pejorative=as.factor(Pejorative),
+  Chained=as.factor(Chained),
+  Associated_verbs=as.factor(Associated_verbs),
+  Author=as.factor(Author),
+  Created=as.numeric(Created),
+  Publ_year=as.numeric(Publ_year),
+  Left_context_tags=as.factor(Left_context_tags),
+  Right_context_tags=as.factor(Right_context_tags),
+  Verb_tags=as.factor(Verb_tags),
+  Left_context_tags_norm=as.factor(Left_context_tags_norm),
+  Right_context_tags_norm=as.factor(Right_context_tags_norm),
+  Grammatical_number=as.factor(Grammatical_number)
+)
+sapply(data, class)
+```
+
+```{r}
+summary(data)
+```
+As a first step, we will use Random forest.
+
+Random forest can't deal with NA's and categorical variables with more then 53 options, so we will exclude such features. Also, we will split data into train and test samples.
+```{r}
+sample = sample.split(data$Semantics, SplitRatio = 0.75)
+train = subset(data, sample == TRUE, select = -c(Right_context, Left_context, Full_context, Center, Created, Publ_year, Associated_verbs, Author, Left_context_tags, Right_context_tags, Left_context_tags_norm, Right_context_tags_norm))
+test  = subset(data, sample == FALSE, select = -c(Right_context, Left_context, Full_context, Center, Created, Publ_year, Associated_verbs, Author, Left_context_tags, Right_context_tags, Left_context_tags_norm, Right_context_tags_norm))
+dim(train)
+dim(test)
+```
+Now let's train the Random forest.
+```{r}
+rf <- randomForest(
+  Semantics ~ .,
+  data=train, importance=TRUE)
+rf
+```
+As we can see from the confusion matrix, `Abundance` class's error equals to 100%. Probably we observe such a poor result due to the class disbalance: `Abudance` has only 17 examples in a train sample. 
+
+`Paragon` class also has poor results: error for this class equals 88%, although it has much more examples (243). 
+
+Errors of the rest of the classes are acceptable.
+
+Let's now look at the feature importance table.
+```{r}
+importance(rf)
+```
+
+```{r}
+varImpPlot(rf)
+```
+We can understand that `Chained` and `Grammatical_number` are the least important variables for prefiction of the `Semantics`. At the same time, `Syntax` and `Semantic_classes_of_nouns` are the leaders due to different scales, which is perfectly consistent to our H_2.
+
+Now let's test our model on a test sample.
+```{r}
+pred = predict(rf, newdata=test[-1])
+cm = table(test[,1], pred)
+cm
+```
+As we can see, `Abudance` examples are not predicted correctly at all; `Extreme` is partially mixed with `Topic change`; `Instrument` is predicted quite accurate; `Paragon` is mixed with `Extreme` and `Topic change`, so almost none of the examples were predicted correctly for this class; `Topic change` is predicted almost perfect.
+
+### 4.2. Linear models
+
+Now let's choose one semantics type and treat our task as 2 class classification task (our chosen class vs all the other classes). `Topic change` has the smallest error value in Random forest model and the biggest number of examples, though we will pick it. Let's first create a new dataset where only two classes are present.
+```{r}
+data_lr <- data
+data_lr <- transform(
+  data_lr,
+  Semantics=as.character(Semantics))
+sapply(data_lr, class)
+
+data_lr[!data_lr$Semantics == 'Topic change',]$Semantics <- 0
+data_lr[data_lr$Semantics == 'Topic change',]$Semantics <- 1
+data_lr <- transform(
+  data_lr,
+  Semantics=as.numeric(Semantics))
+sapply(data_lr, class)
+
+data_lr
+```
+Let's try to make a multinomial regression starting with 1 most important feature and then adding more features. Due to the Random forest's feature importance report, we will add the features in the following order:
+
+* Syntax (51.084035)
+* Pejorative (29.100664)
+* Verb_tags (28.934815)
+* Chained (8.898085)
+* Semantic_classes_of_nouns (3.746766)
+* Grammatical_number (-3.126499)
+
+```{r}
+fit1 <- lm(data = data_lr, Semantics ~ Syntax)
+summary(fit1)
+```
+It seems that only `Ungoverned` value is the important predictor.
+```{r}
+fit2 <- lm(data = data_lr, Semantics ~ Syntax + Pejorative)
+summary(fit2)
+```
+The p-values of `Syntax` options changed, but still only `Syntax:Ungoverned` is important. Also, we can infer that both `Pejorative:yes` and `Pejorative:no` are significant.
+```{r}
+fit3 <- lm(data = data_lr, Semantics ~ Syntax + Pejorative + Verb_tags)
+summary(fit3)
+```
+Nothing changed: none of the `Verb_tags` variants are significant.
+```{r}
+fit4 <- lm(data = data_lr, Semantics ~ Syntax + Pejorative + Verb_tags + Chained)
+summary(fit4)
+```
+`Chained` is also not important in prediction of the `Semantics`.
+```{r}
+fit5 <- lm(data = data_lr, Semantics ~ Syntax + Pejorative + Verb_tags + Chained + Semantic_classes_of_nouns)
+summary(fit5)
+```
+`Semantic_classes_of_nouns` turned out to be significant. Moreover, two of the `Verb_tags` became significant: `[OpencorporaTag('INFN,perf,intr')]` and `[OpencorporaTag('INFN,impf,intr')]`.
+```{r}
+fit6 <- lm(data = data_lr, Semantics ~ Syntax + Pejorative + Verb_tags + Chained + Semantic_classes_of_nouns + Grammatical_number)
+summary(fit6)
+```
+Grammatical number is an important feature while Verb tags isn't. The rest of the results remain the same.
+
+Now let's look at the variable importance of the fit6.
+```{r}
+imp <- as.data.frame(varImp(fit6))
+imp <- data.frame(overall = imp$Overall,
+           names   = rownames(imp))
+imp[order(imp$overall,decreasing = T),]
+```
+We can see that linear model treats `Grammatical_number`, `Semantic_classes_of_nouns` and `Syntax` as 3 most important features for predicting `Topic_change`. Let's try to predict it using the latest model.
+```{r}
+sample = sample.split(data_lr$Semantics, SplitRatio = 0.75)
+train = subset(data_lr, sample == TRUE, select = -c(Right_context, Left_context, Full_context, Center, Created, Publ_year, Associated_verbs, Author, Left_context_tags, Right_context_tags, Left_context_tags_norm, Right_context_tags_norm))
+test  = subset(data_lr, sample == FALSE, select = -c(Right_context, Left_context, Full_context, Center, Created, Publ_year, Associated_verbs, Author, Left_context_tags, Right_context_tags, Left_context_tags_norm, Right_context_tags_norm))
+dim(train)
+dim(test)
+```
+
+```{r}
+p <- predict(fit6, newdata=test[-1], type="response")
+pr <- prediction(p, test$Semantics)
+prf <- performance(pr, measure = "tpr", x.measure = "fpr")
+plot(prf)
+
+auc <- performance(pr, measure = "auc")
+auc <- auc@y.values[[1]]
+auc
+```
+AUC metrics equals to 96% which is a good result.
+
+## 5. Conclusions
+
+All of our hypotheses turned out to be true. The `Semantics` feature is not an independent one, it depends mostly on `Semantic_classes_of_nouns`, `Syntax`, `Pejorative` and `Verb_tags`. It can be explained from the linguistic point of view. Nouns that build NOM INS constructions have their own semantics and make their own contribution to the whole meaning of the phrase. Syntactic features of the construction also play significant role in the semantics due to the fact, that the same words constructions have different meanings when they play different roles in a sentence. Presence or absence of negative shades in the meaning is surely deeply connected to the whole meaning of a word or a construction. Finally, morphological characteristics of the associated verb can be meaningful, because perfect and imperfect tenses, for example, bring different shades of meaning to the verb and, as followed, to the related noun phrase.
+
+
+
+
+
